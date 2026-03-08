@@ -48,7 +48,7 @@ import openpi.training.config as _config
 import openpi.training.data_loader as _data
 import openpi.training.profiling as _profiling
 
-PROFILE_METRIC_KEYS = (
+PROFILE_TIMING_KEYS = (
     "data_loading_ms",
     "host_to_device_ms",
     "preprocess_ms",
@@ -59,6 +59,12 @@ PROFILE_METRIC_KEYS = (
     "optimizer_ms",
     "other_ms",
     "step_total_ms",
+)
+PROFILE_COUNT_KEYS = (
+    "vision_ms_per_camera",
+    "prefix_token_count",
+    "vision_token_count",
+    "prompt_token_count",
 )
 
 
@@ -328,8 +334,27 @@ def average_numeric_metrics(infos):
     return {key: sum(info.get(key, 0.0) for info in infos) / len(infos) for key in keys}
 
 
-def build_step_profile(data_loading_ms, device_metrics, step_total_ms):
-    profile = {key: float(device_metrics.get(key, 0.0)) for key in PROFILE_METRIC_KEYS}
+def compute_batch_profile_counts(observation, *, vision_tokens_per_image):
+    batch_size = observation.state.shape[0]
+    active_image_count = sum(
+        float(mask.to(torch.float32).sum().item()) for mask in observation.image_masks.values()
+    ) / batch_size
+
+    prompt_token_count = 0.0
+    if observation.tokenized_prompt_mask is not None:
+        prompt_token_count = float(observation.tokenized_prompt_mask.to(torch.float32).sum().item()) / batch_size
+
+    vision_token_count = active_image_count * vision_tokens_per_image
+    return {
+        "active_image_count": active_image_count,
+        "vision_token_count": vision_token_count,
+        "prompt_token_count": prompt_token_count,
+        "prefix_token_count": vision_token_count + prompt_token_count,
+    }
+
+
+def build_step_profile(data_loading_ms, device_metrics, step_total_ms, count_metrics):
+    profile = {key: float(device_metrics.get(key, 0.0)) for key in PROFILE_TIMING_KEYS}
     profile["data_loading_ms"] = float(data_loading_ms)
     profile["step_total_ms"] = float(step_total_ms)
 
@@ -344,6 +369,13 @@ def build_step_profile(data_loading_ms, device_metrics, step_total_ms):
         + profile["optimizer_ms"]
     )
     profile["other_ms"] = max(0.0, profile["step_total_ms"] - accounted_ms)
+    profile["vision_ms_per_camera"] = (
+        profile["vision_encoder_ms"] / count_metrics["active_image_count"]
+        if count_metrics["active_image_count"] > 0.0
+        else 0.0
+    )
+    for key in ("prefix_token_count", "vision_token_count", "prompt_token_count"):
+        profile[key] = float(count_metrics[key])
     return profile
 
 
@@ -360,6 +392,16 @@ def format_profile_metrics(profile):
         f"optim={profile['optimizer_ms']:.1f} "
         f"other={profile['other_ms']:.1f} "
         f"total={profile['step_total_ms']:.1f}]"
+    )
+
+
+def format_profile_counts(profile):
+    return (
+        "profile_counts["
+        f"vision_ms_per_camera={profile['vision_ms_per_camera']:.1f} "
+        f"prefix_token_count={profile['prefix_token_count']:.1f} "
+        f"vision_token_count={profile['vision_token_count']:.1f} "
+        f"prompt_token_count={profile['prompt_token_count']:.1f}]"
     )
 
 
@@ -495,6 +537,9 @@ def train_loop(config: _config.TrainConfig):
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
 
+    model_to_profile = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    vision_tokens_per_image = model_to_profile.paligemma_with_expert.paligemma.config.text_config.num_image_tokens
+
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
@@ -585,6 +630,11 @@ def train_loop(config: _config.TrainConfig):
             loader_iter = iter(loader)
             observation, actions = next(loader_iter)
         data_loading_ms = (time.perf_counter() - data_loading_started_at) * 1000.0 if profile_step else 0.0
+        count_metrics = (
+            compute_batch_profile_counts(observation, vision_tokens_per_image=vision_tokens_per_image)
+            if profile_step
+            else None
+        )
 
         device_profiler = _profiling.DeviceSectionProfiler(device) if profile_step else None
         transfer_context = device_profiler.record("host_to_device_ms") if device_profiler is not None else nullcontext()
@@ -647,6 +697,7 @@ def train_loop(config: _config.TrainConfig):
                 data_loading_ms=data_loading_ms,
                 device_metrics=device_metrics,
                 step_total_ms=(time.perf_counter() - step_started_at) * 1000.0,
+                count_metrics=count_metrics,
             )
 
         # Collect stats
@@ -682,7 +733,7 @@ def train_loop(config: _config.TrainConfig):
                 else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
             )
             if avg_profile is not None:
-                log_line = f"{log_line} {format_profile_metrics(avg_profile)}"
+                log_line = f"{log_line} {format_profile_metrics(avg_profile)} {format_profile_counts(avg_profile)}"
             logging.info(log_line)
 
             # Log to wandb

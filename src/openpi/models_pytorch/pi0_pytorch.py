@@ -201,14 +201,34 @@ class PI0Pytorch(nn.Module):
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
+            img_mask = img_mask.to(torch.bool)  # noqa: PLW2901
+            active_indices = torch.nonzero(img_mask, as_tuple=False).squeeze(-1)
+            num_img_embs = self.paligemma_with_expert.paligemma.config.text_config.num_image_tokens
+            image_embed_dim = self.paligemma_with_expert.paligemma.config.vision_config.projection_dim
+            image_embed_dtype = self.paligemma_with_expert.paligemma.multi_modal_projector.linear.weight.dtype
 
             def image_embed_func(img):
                 return self.paligemma_with_expert.embed_image(img)
 
-            with record_section("vision_encoder_ms"):
-                img_emb = self._apply_checkpoint(image_embed_func, img)
+            if active_indices.numel() > 0:
+                active_img = img.index_select(0, active_indices)
+                with record_section("vision_encoder_ms"):
+                    active_img_emb = self._apply_checkpoint(image_embed_func, active_img)
+                num_img_embs = active_img_emb.shape[1]
+                img_emb = torch.zeros(
+                    (img.shape[0], num_img_embs, active_img_emb.shape[2]),
+                    dtype=active_img_emb.dtype,
+                    device=active_img_emb.device,
+                )
+                img_emb = img_emb.index_copy(0, active_indices, active_img_emb)
+            else:
+                img_emb = torch.zeros(
+                    (img.shape[0], num_img_embs, image_embed_dim),
+                    dtype=image_embed_dtype,
+                    device=img.device,
+                )
 
-            bsize, num_img_embs = img_emb.shape[:2]
+            bsize = img_emb.shape[0]
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
