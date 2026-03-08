@@ -30,6 +30,7 @@ import os
 import platform
 import shutil
 import time
+from contextlib import nullcontext
 
 import jax
 import numpy as np
@@ -45,6 +46,20 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.profiling as _profiling
+
+PROFILE_METRIC_KEYS = (
+    "data_loading_ms",
+    "host_to_device_ms",
+    "preprocess_ms",
+    "vision_encoder_ms",
+    "llm_ms",
+    "action_expert_ms",
+    "backward_ms",
+    "optimizer_ms",
+    "other_ms",
+    "step_total_ms",
+)
 
 
 def init_logging():
@@ -306,6 +321,48 @@ def log_memory_usage(device, step, phase="unknown"):
     )
 
 
+def average_numeric_metrics(infos):
+    if not infos:
+        return {}
+    keys = {key for info in infos for key in info}
+    return {key: sum(info.get(key, 0.0) for info in infos) / len(infos) for key in keys}
+
+
+def build_step_profile(data_loading_ms, device_metrics, step_total_ms):
+    profile = {key: float(device_metrics.get(key, 0.0)) for key in PROFILE_METRIC_KEYS}
+    profile["data_loading_ms"] = float(data_loading_ms)
+    profile["step_total_ms"] = float(step_total_ms)
+
+    accounted_ms = (
+        profile["data_loading_ms"]
+        + profile["host_to_device_ms"]
+        + profile["preprocess_ms"]
+        + profile["vision_encoder_ms"]
+        + profile["llm_ms"]
+        + profile["action_expert_ms"]
+        + profile["backward_ms"]
+        + profile["optimizer_ms"]
+    )
+    profile["other_ms"] = max(0.0, profile["step_total_ms"] - accounted_ms)
+    return profile
+
+
+def format_profile_metrics(profile):
+    return (
+        "profile_ms["
+        f"data={profile['data_loading_ms']:.1f} "
+        f"h2d={profile['host_to_device_ms']:.1f} "
+        f"prep={profile['preprocess_ms']:.1f} "
+        f"vision={profile['vision_encoder_ms']:.1f} "
+        f"llm={profile['llm_ms']:.1f} "
+        f"action={profile['action_expert_ms']:.1f} "
+        f"backward={profile['backward_ms']:.1f} "
+        f"optim={profile['optimizer_ms']:.1f} "
+        f"other={profile['other_ms']:.1f} "
+        f"total={profile['step_total_ms']:.1f}]"
+    )
+
+
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
@@ -482,6 +539,7 @@ def train_loop(config: _config.TrainConfig):
     model.train()
     start_time = time.time()
     infos = []  # Collect stats over log interval
+    profile_infos = []
     if is_main:
         logging.info(
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
@@ -498,6 +556,10 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info("EMA is not supported for PyTorch training")
         logging.info(f"Training precision: {model_cfg.dtype}")
+        if config.enable_profiling:
+            logging.info(
+                f"Step profiling enabled; metrics will be collected from step {config.profiling_warmup_steps} onward with synchronous timing."
+            )
 
     # Training loop - iterate until we reach num_train_steps
     pbar = (
@@ -505,44 +567,67 @@ def train_loop(config: _config.TrainConfig):
         if is_main
         else None
     )
+    loader_iter = iter(loader)
 
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
-            # Check if we've reached the target number of steps
-            if global_step >= config.num_train_steps:
-                break
+        profile_step = config.enable_profiling and global_step >= config.profiling_warmup_steps
+        step_started_at = time.perf_counter()
 
-            # The unified data loader returns (observation, actions) tuple
+        if profile_step:
+            data_loading_started_at = time.perf_counter()
+        try:
+            observation, actions = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(loader)
+            observation, actions = next(loader_iter)
+        data_loading_ms = (time.perf_counter() - data_loading_started_at) * 1000.0 if profile_step else 0.0
+
+        device_profiler = _profiling.DeviceSectionProfiler(device) if profile_step else None
+        transfer_context = device_profiler.record("host_to_device_ms") if device_profiler is not None else nullcontext()
+
+        # The unified data loader returns (observation, actions) tuple
+        with transfer_context:
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
-            # Update LR
-            for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+        # Update LR
+        for pg in optim.param_groups:
+            pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+        # Forward pass
+        losses = model(observation, actions, profiler=device_profiler)
+        # Stop recording fine-grained model sections before checkpoint recomputation in backward.
+        if device_profiler is not None:
+            device_profiler.suspend()
 
-            loss = losses.mean()
+        # Ensure losses is a tensor and handle different return types
+        if isinstance(losses, list | tuple):
+            losses = torch.stack(losses)
+        elif not isinstance(losses, torch.Tensor):
+            losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            # Backward pass
+        loss = losses.mean()
+
+        # Backward pass
+        backward_context = (
+            device_profiler.record("backward_ms", force=True) if device_profiler is not None else nullcontext()
+        )
+        with backward_context:
             loss.backward()
 
-            # Log memory usage after backward pass
-            if global_step < 5 and is_main and torch.cuda.is_available():
-                log_memory_usage(device, global_step, "after_backward")
+        # Log memory usage after backward pass
+        if global_step < 5 and is_main and torch.cuda.is_available():
+            log_memory_usage(device, global_step, "after_backward")
 
-            # Gradient clipping
+        optimizer_context = (
+            device_profiler.record("optimizer_ms", force=True) if device_profiler is not None else nullcontext()
+        )
+        with optimizer_context:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
@@ -555,61 +640,78 @@ def train_loop(config: _config.TrainConfig):
                     param.grad.detach_()
                     param.grad = None
 
-            # Collect stats
-            if is_main:
-                infos.append(
-                    {
-                        "loss": loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                    }
-                )
+        profile_metrics = None
+        if device_profiler is not None:
+            device_metrics = device_profiler.finalize()
+            profile_metrics = build_step_profile(
+                data_loading_ms=data_loading_ms,
+                device_metrics=device_metrics,
+                step_total_ms=(time.perf_counter() - step_started_at) * 1000.0,
+            )
 
-            if is_main and (global_step % config.log_interval == 0):
-                elapsed = time.time() - start_time
+        # Collect stats
+        if is_main:
+            infos.append(
+                {
+                    "loss": loss.item(),
+                    "learning_rate": optim.param_groups[0]["lr"],
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                }
+            )
+            if profile_metrics is not None:
+                profile_infos.append(profile_metrics)
 
-                # Average stats over log interval
-                avg_loss = sum(info["loss"] for info in infos) / len(infos)
-                avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+        if is_main and (global_step % config.log_interval == 0):
+            elapsed = time.time() - start_time
+            num_logged_steps = max(1, len(infos))
 
-                avg_grad_norm = None
-                if any("grad_norm" in info for info in infos):
-                    vals = [
-                        info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None
-                    ]
-                    if len(vals) > 0:
-                        avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+            # Average stats over log interval
+            avg_loss = sum(info["loss"] for info in infos) / len(infos)
+            avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
 
-                # Log to wandb
-                if config.wandb_enabled and len(infos) > 0:
-                    log_payload = {
-                        "loss": avg_loss,
-                        "learning_rate": avg_lr,
-                        "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
-                    }
-                    if avg_grad_norm is not None:
-                        log_payload["grad_norm"] = avg_grad_norm
-                    wandb.log(log_payload, step=global_step)
+            avg_grad_norm = None
+            if any("grad_norm" in info for info in infos):
+                vals = [info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None]
+                if len(vals) > 0:
+                    avg_grad_norm = sum(vals) / len(vals)
 
-                start_time = time.time()
-                infos = []  # Reset stats collection
+            avg_profile = average_numeric_metrics(profile_infos) if profile_infos else None
+            log_line = (
+                f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                if avg_grad_norm is not None
+                else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+            )
+            if avg_profile is not None:
+                log_line = f"{log_line} {format_profile_metrics(avg_profile)}"
+            logging.info(log_line)
 
-            global_step += 1
-            # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            # Log to wandb
+            if config.wandb_enabled and len(infos) > 0:
+                log_payload = {
+                    "loss": avg_loss,
+                    "learning_rate": avg_lr,
+                    "step": global_step,
+                    "time_per_step": elapsed / num_logged_steps,
+                }
+                if avg_grad_norm is not None:
+                    log_payload["grad_norm"] = avg_grad_norm
+                if avg_profile is not None:
+                    for key, value in avg_profile.items():
+                        log_payload[f"profile/{key}"] = value
+                wandb.log(log_payload, step=global_step)
 
-            # Update progress bar
-            if pbar is not None:
-                pbar.update(1)
-                pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
-                )
+            start_time = time.time()
+            infos = []  # Reset stats collection
+            profile_infos = []
+
+        global_step += 1
+        # Save checkpoint using the new mechanism
+        save_checkpoint(model, optim, global_step, config, is_main, data_config)
+
+        # Update progress bar
+        if pbar is not None:
+            pbar.update(1)
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step})
 
     # Close progress bar
     if pbar is not None:
