@@ -1,0 +1,16 @@
+{
+  "schema_version": "1",
+  "run_id": "baseline_b1_e2",
+  "command": "lerobot-eval --policy.path=lerobot/pi0_libero_finetuned",
+  "cwd": "/tmp",
+  "env": {"CUDA_VISIBLE_DEVICES": "0"},
+  "start_time_utc": "2026-02-10T00:20:00Z",
+  "policy_path": "lerobot/pi0_libero_finetuned",
+  "task_suite": "libero_object",
+  "batch_size": 1,
+  "n_episodes": 2,
+  "gpu_id": 0,
+  "seed": 7,
+  "mujoco_gl": "egl",
+  "retry_index": 0
+}

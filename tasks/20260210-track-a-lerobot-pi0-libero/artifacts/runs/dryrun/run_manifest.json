@@ -1,0 +1,27 @@
+{
+  "batch_size": 1,
+  "command": "lerobot-eval --policy.path=lerobot/pi0_libero_finetuned --env.type=libero --env.task=libero_object --eval.batch_size=1 --eval.n_episodes=2 --seed=7",
+  "cwd": "/home/ray/default/test_openpi",
+  "env": {
+    "CUDA_VISIBLE_DEVICES": "0",
+    "HF_HOME": "/mnt/cluster_storage/hf_cache",
+    "MUJOCO_EGL_DEVICE_ID": "0",
+    "MUJOCO_GL": "egl",
+    "PYTHONUNBUFFERED": "",
+    "TZ": "America/Los_Angeles"
+  },
+  "git_commit": "0cb902c6ef54b493c4005fd22142ac37066e3eda",
+  "gpu_id": 0,
+  "mujoco_gl": "egl",
+  "n_episodes": 2,
+  "policy_path": "lerobot/pi0_libero_finetuned",
+  "retry_index": 0,
+  "run_id": "dryrun",
+  "schema_version": "1",
+  "seed": 7,
+  "start_time_utc": "2026-02-10T22:36:15Z",
+  "stderr_log": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/dryrun/stderr.log",
+  "stdout_log": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/dryrun/stdout.log",
+  "task_suite": "libero_object",
+  "timeout_secs": 10800
+}

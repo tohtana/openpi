@@ -1,0 +1,15 @@
+{
+  "display_env": "",
+  "env_name": "vla_pi0",
+  "generated_at_utc": "2026-02-19T17:59:48Z",
+  "hf_home": "/mnt/local_storage/huggingface",
+  "lerobot_commit": "2dd366436ed30ed9729b4f18076a54fec7ec589b",
+  "lerobot_dir": "/mnt/local_storage/src/lerobot",
+  "mujoco_gl": "",
+  "python_bin": "/home/ray/anaconda3/envs/vla_pi0/bin/python",
+  "python_version_actual": "Python 3.10.19",
+  "requested_python_version": "3.10",
+  "schema_version": "1",
+  "toolchain": "conda",
+  "tz": "UTC"
+}

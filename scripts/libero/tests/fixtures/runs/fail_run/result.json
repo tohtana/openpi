@@ -1,0 +1,15 @@
+{
+  "schema_version": "1",
+  "run_id": "fail_run",
+  "exit_code": 124,
+  "status": "fail",
+  "end_time_utc": "2026-02-10T00:02:00Z",
+  "duration_sec": 120.0,
+  "successes": null,
+  "episodes": 8,
+  "success_rate": null,
+  "video_path": null,
+  "stdout_log": "scripts/libero/tests/fixtures/runs/fail_run/stdout.log",
+  "stderr_log": "scripts/libero/tests/fixtures/runs/fail_run/stderr.log",
+  "error_message": "timed out"
+}

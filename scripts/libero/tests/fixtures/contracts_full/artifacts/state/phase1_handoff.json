@@ -1,0 +1,9 @@
+{
+  "phase": "phase1",
+  "status": "pass",
+  "generated_at_utc": "2026-02-10T00:00:00Z",
+  "git_commit": "abc123",
+  "inputs": [],
+  "outputs": ["artifacts/state/cli_capabilities.json"],
+  "notes": "ok"
+}

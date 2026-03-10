@@ -1,0 +1,3 @@
+run_id,status,exit_code
+baseline_b1_e2_glx,fail,1
+dryrun,dry_run,0

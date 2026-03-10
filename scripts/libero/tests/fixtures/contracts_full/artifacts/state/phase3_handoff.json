@@ -1,0 +1,9 @@
+{
+  "phase": "phase3",
+  "status": "pass",
+  "generated_at_utc": "2026-02-10T00:25:00Z",
+  "git_commit": "abc123",
+  "inputs": ["artifacts/state/phase2_handoff.json"],
+  "outputs": ["artifacts/summary/baseline_summary.csv"],
+  "notes": "ok"
+}

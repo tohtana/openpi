@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "github.json v1",
+  "description": "Per-slug GitHub metadata for TODO workflow",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "repo",
+    "issue_number",
+    "issue_url",
+    "slug",
+    "type",
+    "comment_ids"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "repo": {
+      "type": "string"
+    },
+    "issue_number": {
+      "type": "integer"
+    },
+    "issue_url": {
+      "type": "string",
+      "format": "uri"
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "feature",
+        "debug",
+        "review",
+        "docs",
+        "infra"
+      ]
+    },
+    "pr_number": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "pr_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "comment_ids": {
+      "type": "object",
+      "required": [
+        "design-doc",
+        "impl-plan",
+        "impl-artifacts",
+        "final-summary"
+      ],
+      "properties": {
+        "design-doc": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "impl-plan": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "impl-artifacts": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "final-summary": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    }
+  },
+  "additionalProperties": false
+}

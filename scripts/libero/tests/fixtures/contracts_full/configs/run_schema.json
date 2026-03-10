@@ -1,0 +1,4 @@
+{
+  "run_manifest": {"required": ["run_id", "task_suite", "batch_size"]},
+  "result": {"required": ["run_id", "status", "exit_code"]}
+}

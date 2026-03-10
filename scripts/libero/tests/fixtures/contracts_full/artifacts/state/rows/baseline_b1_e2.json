@@ -1,0 +1,11 @@
+{
+  "schema_version": "1",
+  "run_id": "baseline_b1_e2",
+  "status": "pass",
+  "retry_index": 0,
+  "gpu_id": 0,
+  "started_at_utc": "2026-02-10T00:20:00Z",
+  "ended_at_utc": "2026-02-10T00:21:00Z",
+  "result_path": "artifacts/runs/baseline_b1_e2/result.json",
+  "notes": ""
+}

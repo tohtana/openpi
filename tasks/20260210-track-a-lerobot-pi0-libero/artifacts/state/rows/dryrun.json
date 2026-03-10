@@ -1,0 +1,11 @@
+{
+  "ended_at_utc": "2026-02-10T22:36:15Z",
+  "gpu_id": 0,
+  "notes": "dry-run",
+  "result_path": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/dryrun/result.json",
+  "retry_index": 0,
+  "run_id": "dryrun",
+  "schema_version": "1",
+  "started_at_utc": "2026-02-10T22:36:15Z",
+  "status": "pass"
+}

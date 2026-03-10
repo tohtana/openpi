@@ -1,0 +1,11 @@
+{
+  "ended_at_utc": "2026-02-19T18:54:10Z",
+  "gpu_id": 0,
+  "notes": "eval failed; inspect result.json",
+  "result_path": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/baseline_b1_e2_glx/result.json",
+  "retry_index": 0,
+  "run_id": "baseline_b1_e2_glx",
+  "schema_version": "1",
+  "started_at_utc": "2026-02-19T18:54:00Z",
+  "status": "fail"
+}

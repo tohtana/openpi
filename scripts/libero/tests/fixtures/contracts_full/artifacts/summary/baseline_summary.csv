@@ -1,0 +1,2 @@
+run_id,task_suite,batch_size,n_episodes,gpu_id,success_rate,successes,failures,exit_code,status,stdout_log,stderr_log,video_path
+baseline_b1_e2,libero_object,1,2,0,0.5,1,1,0,pass,stdout.log,stderr.log,rollout.mp4

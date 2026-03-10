@@ -1,0 +1,15 @@
+{
+  "duration_sec": 0.0,
+  "end_time_utc": "2026-02-10T22:36:15Z",
+  "episodes": null,
+  "error_message": "",
+  "exit_code": 0,
+  "run_id": "dryrun",
+  "schema_version": "1",
+  "status": "dry_run",
+  "stderr_log": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/dryrun/stderr.log",
+  "stdout_log": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/dryrun/stdout.log",
+  "success_rate": null,
+  "successes": null,
+  "video_path": null
+}

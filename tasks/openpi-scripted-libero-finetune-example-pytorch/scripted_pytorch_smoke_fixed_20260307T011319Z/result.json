@@ -1,0 +1,13 @@
+{
+  "checkpoint_run_dir": "/mnt/local_storage/experiments/openpi_pytorch_checkpoints/pi05_libero/scripted_pytorch_smoke_fixed_20260307T011319Z",
+  "checkpoint_run_dir_exists": true,
+  "convert_log": "/home/ray/default/vla/test_openpi/tasks/openpi-scripted-libero-finetune-example-pytorch/scripted_pytorch_smoke_fixed_20260307T011319Z/convert_checkpoint.log",
+  "converted_weight_dir": "/mnt/local_storage/experiments/openpi_pytorch/pi05_base_for_libero_bfloat16",
+  "converted_weight_exists": true,
+  "latest_checkpoint_dir": "/mnt/local_storage/experiments/openpi_pytorch_checkpoints/pi05_libero/scripted_pytorch_smoke_fixed_20260307T011319Z/1",
+  "norm_stats_exists": true,
+  "norm_stats_file": "/home/ray/default/vla/test_openpi/openpi/assets/pi05_libero/physical-intelligence/libero/norm_stats.json",
+  "patch_log": "/home/ray/default/vla/test_openpi/tasks/openpi-scripted-libero-finetune-example-pytorch/scripted_pytorch_smoke_fixed_20260307T011319Z/patch_transformers.log",
+  "schema_version": 1,
+  "train_log": "/home/ray/default/vla/test_openpi/tasks/openpi-scripted-libero-finetune-example-pytorch/scripted_pytorch_smoke_fixed_20260307T011319Z/train_pytorch.log"
+}

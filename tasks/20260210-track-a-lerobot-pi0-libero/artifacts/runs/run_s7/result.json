@@ -1,0 +1,15 @@
+{
+  "duration_sec": 4833.0,
+  "end_time_utc": "2026-02-20T20:15:31Z",
+  "episodes": 16,
+  "error_message": "",
+  "exit_code": 0,
+  "run_id": "run_s7",
+  "schema_version": "1",
+  "status": "pass",
+  "stderr_log": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s7/stderr.log",
+  "stdout_log": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s7/stdout.log",
+  "success_rate": 0.78125,
+  "successes": 12,
+  "video_path": "['outputs/eval/2026-02-20/10-55-09_libero_pi0/videos/libero_object_0/eval_episode_0.mp4"
+}

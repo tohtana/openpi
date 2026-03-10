@@ -1,0 +1,2 @@
+run_id,task_suite,batch_size,n_episodes,gpu_id,seed,mujoco_gl,policy_path,enabled
+baseline_b1_e2,libero_object,1,2,0,7,egl,lerobot/pi0_libero_finetuned,1

@@ -1,0 +1,11 @@
+{
+  "ended_at_utc": "2026-02-20T20:19:25Z",
+  "gpu_id": 5,
+  "notes": "",
+  "result_path": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s6/result.json",
+  "retry_index": 0,
+  "run_id": "run_s6",
+  "schema_version": "1",
+  "started_at_utc": "2026-02-20T18:54:58Z",
+  "status": "pass"
+}

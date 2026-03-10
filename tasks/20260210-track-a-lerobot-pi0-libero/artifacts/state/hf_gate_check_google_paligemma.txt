@@ -1,0 +1,2 @@
+OK /mnt/cluster_storage/hf_cache/hub/models--google--paligemma-3b-pt-224/snapshots/35e4f46485b4d07967e7e9935bc3786aad50687c/config.json
+

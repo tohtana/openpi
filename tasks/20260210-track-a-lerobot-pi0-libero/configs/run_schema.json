@@ -1,0 +1,62 @@
+{
+  "schema_version": "1",
+  "run_manifest": {
+    "required": [
+      "schema_version",
+      "run_id",
+      "command",
+      "cwd",
+      "env",
+      "start_time_utc",
+      "policy_path",
+      "task_suite",
+      "batch_size",
+      "n_episodes",
+      "gpu_id",
+      "seed",
+      "mujoco_gl",
+      "retry_index"
+    ]
+  },
+  "result": {
+    "required": [
+      "schema_version",
+      "run_id",
+      "exit_code",
+      "status",
+      "end_time_utc",
+      "duration_sec",
+      "successes",
+      "episodes",
+      "success_rate",
+      "video_path",
+      "stdout_log",
+      "stderr_log",
+      "error_message"
+    ]
+  },
+  "row_marker": {
+    "required": [
+      "schema_version",
+      "run_id",
+      "status",
+      "retry_index",
+      "gpu_id",
+      "started_at_utc",
+      "ended_at_utc",
+      "result_path",
+      "notes"
+    ]
+  },
+  "phase_handoff": {
+    "required": [
+      "phase",
+      "status",
+      "generated_at_utc",
+      "git_commit",
+      "inputs",
+      "outputs",
+      "notes"
+    ]
+  }
+}

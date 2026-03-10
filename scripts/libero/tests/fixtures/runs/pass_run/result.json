@@ -1,0 +1,15 @@
+{
+  "schema_version": "1",
+  "run_id": "pass_run",
+  "exit_code": 0,
+  "status": "pass",
+  "end_time_utc": "2026-02-10T00:01:00Z",
+  "duration_sec": 60.0,
+  "successes": 1,
+  "episodes": 2,
+  "success_rate": 0.5,
+  "video_path": "rollout.mp4",
+  "stdout_log": "scripts/libero/tests/fixtures/runs/pass_run/stdout.log",
+  "stderr_log": "scripts/libero/tests/fixtures/runs/pass_run/stderr.log",
+  "error_message": ""
+}

@@ -1,0 +1,15 @@
+{
+  "schema_version": "1",
+  "run_id": "baseline_b1_e2",
+  "exit_code": 0,
+  "status": "pass",
+  "end_time_utc": "2026-02-10T00:21:00Z",
+  "duration_sec": 60,
+  "successes": 1,
+  "episodes": 2,
+  "success_rate": 0.5,
+  "video_path": "rollout.mp4",
+  "stdout_log": "stdout.log",
+  "stderr_log": "stderr.log",
+  "error_message": ""
+}

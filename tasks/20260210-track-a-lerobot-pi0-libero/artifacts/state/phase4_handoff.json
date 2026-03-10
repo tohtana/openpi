@@ -1,0 +1,24 @@
+{
+  "phase": "phase4",
+  "status": "pass",
+  "generated_at_utc": "2026-02-20T21:02:27Z",
+  "git_commit": "dc90b6cacffc020182f8df4bb165e8dd260091b6",
+  "inputs": [
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/state/phase3_handoff.json",
+    "tasks/20260210-track-a-lerobot-pi0-libero/configs/eval_matrix.csv"
+  ],
+  "outputs": [
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s1/result.json",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s2/result.json",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s3/result.json",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s4/result.json",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s5/result.json",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s6/result.json",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s7/result.json",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/run_s8/result.json",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/summary/all_runs.csv",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/summary/all_runs.md",
+    "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/summary/failures.csv"
+  ],
+  "notes": "Scaled sweep rows run_s1..run_s8 completed: completed_rows=8, failed_rows=0, mean_success_rate=0.7625."
+}

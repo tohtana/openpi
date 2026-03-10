@@ -1,0 +1,14 @@
+{
+  "schema_version": "1",
+  "checks": {"gpu_ids_requested_present": true},
+  "gpu_count": 8,
+  "gpu_names": ["H100", "H100", "H100", "H100", "H100", "H100", "H100", "H100"],
+  "display_env": "",
+  "mujoco_gl_requested": "egl",
+  "mujoco_gl_effective": "egl",
+  "backend_attempts": [{"backend": "egl", "ok": true, "message": "ok"}],
+  "python_version": "3.10",
+  "lerobot_import_ok": true,
+  "lerobot_eval_help_ok": true,
+  "policy_resolve_ok": true
+}

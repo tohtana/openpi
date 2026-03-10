@@ -1,0 +1,15 @@
+{
+  "duration_sec": 10.0,
+  "end_time_utc": "2026-02-19T18:54:10Z",
+  "episodes": 2,
+  "error_message": "lerobot-eval exited with code 1",
+  "exit_code": 1,
+  "run_id": "baseline_b1_e2_glx",
+  "schema_version": "1",
+  "status": "fail",
+  "stderr_log": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/baseline_b1_e2_glx/stderr.log",
+  "stdout_log": "tasks/20260210-track-a-lerobot-pi0-libero/artifacts/runs/baseline_b1_e2_glx/stdout.log",
+  "success_rate": null,
+  "successes": null,
+  "video_path": null
+}
