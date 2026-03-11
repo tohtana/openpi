@@ -44,3 +44,13 @@ def test_pi0_all_lora():
     assert len(state) == 17
     assert all("lora" not in p for p in state)
     assert all("llm" in p for p in state)
+
+
+def test_pi0_vision_encoder_image_mode_defaults_to_iterative():
+    config = _pi0_config.Pi0Config()
+    assert config.vision_encoder_image_mode == "iterative"
+
+
+def test_pi0_vision_encoder_image_mode_accepts_packed():
+    config = _pi0_config.Pi0Config(vision_encoder_image_mode="packed")
+    assert config.vision_encoder_image_mode == "packed"

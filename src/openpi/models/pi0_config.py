@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import flax.nnx as nnx
 import jax
@@ -14,12 +14,15 @@ import openpi.shared.nnx_utils as nnx_utils
 if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
 
+VisionEncoderImageMode = Literal["iterative", "packed"]
+
 
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
+    vision_encoder_image_mode: VisionEncoderImageMode = "iterative"
 
     # Set the model specific defaults.
     action_dim: int = 32
@@ -33,6 +36,11 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     def __post_init__(self):
+        if self.vision_encoder_image_mode not in ("iterative", "packed"):
+            raise ValueError(
+                "vision_encoder_image_mode must be one of "
+                f"('iterative', 'packed'), got {self.vision_encoder_image_mode!r}"
+            )
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:

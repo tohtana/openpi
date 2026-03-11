@@ -86,6 +86,7 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        self._packed_image_fallback_logged = False
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -122,6 +123,8 @@ class PI0Pytorch(nn.Module):
                 raise ValueError(msg)
         except ImportError:
             raise ValueError(msg) from None
+
+        logging.info("Vision encoder image mode: %s", self.config.vision_encoder_image_mode)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -183,6 +186,110 @@ class PI0Pytorch(nn.Module):
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
 
+    def _embed_image_batch(self, img: torch.Tensor) -> torch.Tensor:
+        return self._apply_checkpoint(self.paligemma_with_expert.embed_image, img)
+
+    def _log_packed_image_fallback(self, reason: str) -> None:
+        if not self._packed_image_fallback_logged:
+            logging.warning(
+                "Falling back to iterative vision encoder path while packed mode is configured: %s",
+                reason,
+            )
+            self._packed_image_fallback_logged = True
+
+    def _can_pack_image_streams(self, images, img_masks) -> tuple[bool, str | None]:
+        if not images:
+            return True, None
+
+        first_img = images[0]
+        first_mask = img_masks[0]
+        if first_img.ndim != 4:
+            return False, f"expected 4D image tensors, got ndim={first_img.ndim}"
+
+        for stream_idx, (img, img_mask) in enumerate(zip(images[1:], img_masks[1:], strict=True), start=1):
+            if img.ndim != 4:
+                return False, f"stream {stream_idx} has ndim={img.ndim}"
+            if img.device != first_img.device:
+                return False, f"stream {stream_idx} is on {img.device}, expected {first_img.device}"
+            if img.dtype != first_img.dtype:
+                return False, f"stream {stream_idx} has dtype {img.dtype}, expected {first_img.dtype}"
+            if img.shape[0] != first_img.shape[0]:
+                return False, f"stream {stream_idx} has batch size {img.shape[0]}, expected {first_img.shape[0]}"
+            if img.shape[1:] != first_img.shape[1:]:
+                return False, f"stream {stream_idx} has shape {tuple(img.shape[1:])}, expected {tuple(first_img.shape[1:])}"
+            if img_mask.shape != first_mask.shape:
+                return False, f"stream {stream_idx} mask shape {tuple(img_mask.shape)} != {tuple(first_mask.shape)}"
+
+        return True, None
+
+    def _get_zero_image_embedding_template(self, img: torch.Tensor) -> torch.Tensor:
+        model = self.paligemma_with_expert.paligemma.model
+        vision_embeddings = model.vision_tower.vision_model.embeddings
+        projector = model.multi_modal_projector.linear
+        num_img_embs = vision_embeddings.num_patches
+        emb_dim = projector.out_features
+        return torch.zeros(
+            img.shape[0],
+            num_img_embs,
+            emb_dim,
+            device=img.device,
+            dtype=projector.weight.dtype,
+        )
+
+    def _embed_images_iterative(self, images, img_masks):
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        for img, img_mask in zip(images, img_masks, strict=True):
+            img_emb = self._embed_image_batch(img)
+            bsize, num_img_embs = img_emb.shape[:2]
+            embs.append(img_emb)
+            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            att_masks += [0] * num_img_embs
+
+        return embs, pad_masks, att_masks
+
+    def _embed_images_packed(self, images, img_masks):
+        can_pack, reason = self._can_pack_image_streams(images, img_masks)
+        if not can_pack:
+            self._log_packed_image_fallback(reason or "unknown reason")
+            return self._embed_images_iterative(images, img_masks)
+
+        packed_images = []
+        active_indices_per_stream = []
+        active_count = 0
+        for img, img_mask in zip(images, img_masks, strict=True):
+            active_indices = torch.nonzero(img_mask, as_tuple=False).flatten()
+            active_indices_per_stream.append(active_indices)
+            if active_indices.numel() > 0:
+                packed_images.append(img.index_select(0, active_indices))
+                active_count += int(active_indices.numel())
+
+        if active_count == 0:
+            packed_img_emb = self._get_zero_image_embedding_template(images[0])
+        else:
+            packed_img_emb = self._embed_image_batch(torch.cat(packed_images, dim=0))
+
+        bsize = images[0].shape[0]
+        num_img_embs = packed_img_emb.shape[1]
+        embs = []
+        pad_masks = []
+        att_masks = [0] * num_img_embs
+        offset = 0
+
+        for img_mask, active_indices in zip(img_masks, active_indices_per_stream, strict=True):
+            img_emb = packed_img_emb.new_zeros((bsize, num_img_embs, packed_img_emb.shape[2]))
+            if active_indices.numel() > 0:
+                next_offset = offset + active_indices.numel()
+                img_emb[active_indices] = packed_img_emb[offset:next_offset]
+                offset = next_offset
+            embs.append(img_emb)
+            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+
+        att_masks *= len(images)
+        return embs, pad_masks, att_masks
+
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -193,21 +300,14 @@ class PI0Pytorch(nn.Module):
         pad_masks = []
         att_masks = []
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        if self.config.vision_encoder_image_mode == "packed":
+            image_embs, image_pad_masks, image_att_masks = self._embed_images_packed(images, img_masks)
+        else:
+            image_embs, image_pad_masks, image_att_masks = self._embed_images_iterative(images, img_masks)
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
-
-            img_emb = self._apply_checkpoint(image_embed_func, img)
-
-            bsize, num_img_embs = img_emb.shape[:2]
-
-            embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
+        embs.extend(image_embs)
+        pad_masks.extend(image_pad_masks)
+        att_masks.extend(image_att_masks)
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
