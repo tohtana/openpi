@@ -1,5 +1,6 @@
 import logging
 import math
+from contextlib import nullcontext
 
 import torch
 from torch import Tensor
@@ -236,25 +237,37 @@ class PI0Pytorch(nn.Module):
             dtype=projector.weight.dtype,
         )
 
-    def _embed_images_iterative(self, images, img_masks):
+    def _embed_images_iterative(self, images, img_masks, *, profiler=None):
         embs = []
         pad_masks = []
         att_masks = []
 
         for img, img_mask in zip(images, img_masks, strict=True):
-            img_emb = self._embed_image_batch(img)
-            bsize, num_img_embs = img_emb.shape[:2]
+            img_mask = img_mask.to(torch.bool)  # noqa: PLW2901
+            active_indices = torch.nonzero(img_mask, as_tuple=False).flatten()
+            if active_indices.numel() > 0:
+                active_img = img.index_select(0, active_indices)
+                record_section = profiler.record("vision_encoder_ms") if profiler is not None else nullcontext()
+                with record_section:
+                    active_img_emb = self._embed_image_batch(active_img)
+                num_img_embs = active_img_emb.shape[1]
+                img_emb = active_img_emb.new_zeros((img.shape[0], num_img_embs, active_img_emb.shape[2]))
+                img_emb = img_emb.index_copy(0, active_indices, active_img_emb)
+            else:
+                img_emb = self._get_zero_image_embedding_template(img)
+                num_img_embs = img_emb.shape[1]
+            bsize = img_emb.shape[0]
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
 
         return embs, pad_masks, att_masks
 
-    def _embed_images_packed(self, images, img_masks):
+    def _embed_images_packed(self, images, img_masks, *, profiler=None):
         can_pack, reason = self._can_pack_image_streams(images, img_masks)
         if not can_pack:
             self._log_packed_image_fallback(reason or "unknown reason")
-            return self._embed_images_iterative(images, img_masks)
+            return self._embed_images_iterative(images, img_masks, profiler=profiler)
 
         packed_images = []
         active_indices_per_stream = []
@@ -269,7 +282,9 @@ class PI0Pytorch(nn.Module):
         if active_count == 0:
             packed_img_emb = self._get_zero_image_embedding_template(images[0])
         else:
-            packed_img_emb = self._embed_image_batch(torch.cat(packed_images, dim=0))
+            record_section = profiler.record("vision_encoder_ms") if profiler is not None else nullcontext()
+            with record_section:
+                packed_img_emb = self._embed_image_batch(torch.cat(packed_images, dim=0))
 
         bsize = images[0].shape[0]
         num_img_embs = packed_img_emb.shape[1]
@@ -291,19 +306,28 @@ class PI0Pytorch(nn.Module):
         return embs, pad_masks, att_masks
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, *, profiler=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
         """
+        def record_section(name: str):
+            if profiler is None:
+                return nullcontext()
+            return profiler.record(name)
+
         embs = []
         pad_masks = []
         att_masks = []
 
         if self.config.vision_encoder_image_mode == "packed":
-            image_embs, image_pad_masks, image_att_masks = self._embed_images_packed(images, img_masks)
+            image_embs, image_pad_masks, image_att_masks = self._embed_images_packed(
+                images, img_masks, profiler=profiler
+            )
         else:
-            image_embs, image_pad_masks, image_att_masks = self._embed_images_iterative(images, img_masks)
+            image_embs, image_pad_masks, image_att_masks = self._embed_images_iterative(
+                images, img_masks, profiler=profiler
+            )
 
         embs.extend(image_embs)
         pad_masks.extend(image_pad_masks)
@@ -315,7 +339,8 @@ class PI0Pytorch(nn.Module):
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+        with record_section("llm_ms"):
+            lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -334,8 +359,13 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
+    def embed_suffix(self, state, noisy_actions, timestep, *, profiler=None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+        def record_section(name: str):
+            if profiler is None:
+                return nullcontext()
+            return profiler.record(name)
+
         embs = []
         pad_masks = []
         att_masks = []
@@ -348,7 +378,8 @@ class PI0Pytorch(nn.Module):
             def state_proj_func(state):
                 return self.state_proj(state)
 
-            state_emb = self._apply_checkpoint(state_proj_func, state)
+            with record_section("action_expert_ms"):
+                state_emb = self._apply_checkpoint(state_proj_func, state)
 
             embs.append(state_emb[:, None, :])
             bsize = state_emb.shape[0]
@@ -370,7 +401,8 @@ class PI0Pytorch(nn.Module):
         def action_proj_func(noisy_actions):
             return self.action_in_proj(noisy_actions)
 
-        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+        with record_section("action_expert_ms"):
+            action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         if not self.pi05:
             time_emb = time_emb[:, None, :].expand_as(action_emb)
@@ -382,7 +414,8 @@ class PI0Pytorch(nn.Module):
                 x = F.silu(x)  # swish == silu
                 return self.action_time_mlp_out(x)
 
-            action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
+            with record_section("action_expert_ms"):
+                action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
             adarms_cond = None
         else:
             # time MLP (for adaRMS)
@@ -392,7 +425,8 @@ class PI0Pytorch(nn.Module):
                 x = self.time_mlp_out(x)
                 return F.silu(x)
 
-            time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+            with record_section("action_expert_ms"):
+                time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
             action_time_emb = action_emb
             adarms_cond = time_emb
 
@@ -413,9 +447,15 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
+    def forward(self, observation, actions, noise=None, time=None, profiler=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        def record_section(name: str):
+            if profiler is None:
+                return nullcontext()
+            return profiler.record(name)
+
+        with record_section("preprocess_ms"):
+            images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -427,8 +467,12 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, profiler=profiler
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, time, profiler=profiler
+        )
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -454,6 +498,7 @@ class PI0Pytorch(nn.Module):
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                profiler=profiler,
             )
             return suffix_out
 
@@ -468,7 +513,8 @@ class PI0Pytorch(nn.Module):
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        with record_section("action_expert_ms"):
+            v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
 

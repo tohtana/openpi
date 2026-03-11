@@ -525,6 +525,11 @@ class TrainConfig:
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
+    # If true, log a synchronous per-step timing breakdown for profiling.
+    enable_profiling: bool = False
+    # Number of initial steps to skip before collecting profiling metrics.
+    profiling_warmup_steps: int = 1
+
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
@@ -554,6 +559,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.profiling_warmup_steps < 0:
+            raise ValueError("profiling_warmup_steps must be non-negative.")
 
 
 # Use `get_config` if you need to get a config by name in your code.

@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Literal
 
 import pytest
@@ -96,30 +97,38 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        profiler=None,
     ):
+        def record_section(name: str | None = None, *, allocation: dict[str, float] | None = None):
+            if profiler is None:
+                return nullcontext()
+            return profiler.record(name, allocation=allocation)
+
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
-            prefix_output = self.paligemma.language_model.forward(
-                inputs_embeds=inputs_embeds[0],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
-            )
+            with record_section("llm_ms"):
+                prefix_output = self.paligemma.language_model.forward(
+                    inputs_embeds=inputs_embeds[0],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                )
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            suffix_output = self.gemma_expert.model.forward(
-                inputs_embeds=inputs_embeds[1],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
-            )
+            with record_section("action_expert_ms"):
+                suffix_output = self.gemma_expert.model.forward(
+                    inputs_embeds=inputs_embeds[1],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                )
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
@@ -163,15 +172,17 @@ class PaliGemmaWithExpertModel(nn.Module):
                 value_states = []
                 gates = []
                 for i, hidden_states in enumerate(inputs_embeds):
-                    layer = models[i].layers[layer_idx]
-                    hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
-                    gates.append(gate)
+                    bucket_name = "llm_ms" if i == 0 else "action_expert_ms"
+                    with record_section(bucket_name):
+                        layer = models[i].layers[layer_idx]
+                        hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
+                        gates.append(gate)
 
-                    input_shape = hidden_states.shape[:-1]
-                    hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-                    query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                    value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                        input_shape = hidden_states.shape[:-1]
+                        hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+                        query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                        key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                        value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
                     query_states.append(query_state)
                     key_states.append(key_state)
@@ -198,14 +209,21 @@ class PaliGemmaWithExpertModel(nn.Module):
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
                 # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
-                )
+                prefix_tokens = inputs_embeds[0].shape[1]
+                suffix_tokens = inputs_embeds[1].shape[1]
+                attention_allocation = {
+                    "llm_ms": prefix_tokens,
+                    "action_expert_ms": suffix_tokens,
+                }
+                with record_section(allocation=attention_allocation):
+                    att_output, _ = modeling_gemma.eager_attention_forward(
+                        self.paligemma.language_model.layers[layer_idx].self_attn,
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        scaling,
+                    )
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
@@ -214,26 +232,29 @@ class PaliGemmaWithExpertModel(nn.Module):
                 outputs_embeds = []
                 start_pos = 0
                 for i, hidden_states in enumerate(inputs_embeds):
-                    layer = models[i].layers[layer_idx]
-                    end_pos = start_pos + hidden_states.shape[1]
+                    bucket_name = "llm_ms" if i == 0 else "action_expert_ms"
+                    with record_section(bucket_name):
+                        layer = models[i].layers[layer_idx]
+                        end_pos = start_pos + hidden_states.shape[1]
 
-                    if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-                        att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                    out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+                        model_att_output = att_output
+                        if model_att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                            model_att_output = model_att_output.to(layer.self_attn.o_proj.weight.dtype)
+                        out_emb = layer.self_attn.o_proj(model_att_output[:, start_pos:end_pos])
 
-                    # first residual
-                    out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
-                    after_first_residual = out_emb.clone()
-                    out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
-                    # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-                    if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-                        out_emb = out_emb.to(dtype=torch.bfloat16)
+                        # first residual
+                        out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+                        after_first_residual = out_emb.clone()
+                        out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
+                        # Convert to bfloat16 if the next layer (mlp) uses bfloat16
+                        if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                            out_emb = out_emb.to(dtype=torch.bfloat16)
 
-                    out_emb = layer.mlp(out_emb)
-                    # second residual
-                    out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
-                    outputs_embeds.append(out_emb)
-                    start_pos = end_pos
+                        out_emb = layer.mlp(out_emb)
+                        # second residual
+                        out_emb = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+                        outputs_embeds.append(out_emb)
+                        start_pos = end_pos
 
                 return outputs_embeds
 
