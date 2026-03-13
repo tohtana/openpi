@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--module-step-kind", default="forward_only", choices=("forward_only", "train_like"))
     parser.add_argument(
         "--modes",
         nargs="+",
@@ -125,8 +126,15 @@ def run_action(model, state, x_t, timestep):
 
 
 def build_optimizer(config: _config.TrainConfig, model: torch.nn.Module) -> torch.optim.Optimizer:
+    return build_optimizer_for_parameters(config, list(model.parameters()))
+
+
+def build_optimizer_for_parameters(
+    config: _config.TrainConfig,
+    parameters: list[torch.nn.Parameter],
+) -> torch.optim.Optimizer:
     return torch.optim.AdamW(
-        model.parameters(),
+        parameters,
         lr=config.lr_schedule.peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -152,6 +160,74 @@ def run_entire(model, optimizer, observation, actions, clip_gradient_norm: float
     }
 
 
+def get_module_parameters(model: torch.nn.Module, mode: str) -> list[torch.nn.Parameter]:
+    prefix_map = {
+        "vision": (
+            "paligemma_with_expert.paligemma.model.vision_tower",
+            "paligemma_with_expert.paligemma.model.multi_modal_projector",
+        ),
+        "llm": ("paligemma_with_expert.paligemma.model.language_model",),
+        "action": (
+            "paligemma_with_expert.gemma_expert.model",
+            "action_in_proj",
+            "action_out_proj",
+            "time_mlp_in",
+            "time_mlp_out",
+            "state_proj",
+            "action_time_mlp_in",
+            "action_time_mlp_out",
+        ),
+    }
+    prefixes = prefix_map[mode]
+    parameters = [param for name, param in model.named_parameters() if any(name.startswith(prefix) for prefix in prefixes)]
+    if not parameters:
+        raise ValueError(f"No parameters matched mode={mode!r}")
+    return parameters
+
+
+def set_trainable_parameters(model: torch.nn.Module, trainable_parameters: list[torch.nn.Parameter]) -> list[tuple[torch.nn.Parameter, bool]]:
+    trainable_ids = {id(param) for param in trainable_parameters}
+    original_states: list[tuple[torch.nn.Parameter, bool]] = []
+    for param in model.parameters():
+        original_states.append((param, param.requires_grad))
+        param.requires_grad_(id(param) in trainable_ids)
+    return original_states
+
+
+def restore_trainable_parameters(original_states: list[tuple[torch.nn.Parameter, bool]]) -> None:
+    for param, requires_grad in original_states:
+        param.requires_grad_(requires_grad)
+
+
+def dummy_loss_from_outputs(outputs) -> torch.Tensor:
+    if isinstance(outputs, torch.Tensor):
+        if not outputs.requires_grad:
+            raise TypeError("Tensor output does not require grad.")
+        return outputs.float().square().mean()
+    if isinstance(outputs, list | tuple):
+        losses = []
+        for output in outputs:
+            try:
+                losses.append(dummy_loss_from_outputs(output))
+            except TypeError:
+                continue
+        if not losses:
+            raise TypeError("Expected at least one differentiable tensor output for dummy loss construction.")
+        return torch.stack(losses).sum()
+    raise TypeError(f"Unsupported output type for dummy loss: {type(outputs)!r}")
+
+
+def run_module_train_like(forward_fn, optimizer: torch.optim.Optimizer) -> dict[str, object]:
+    outputs = forward_fn()
+    loss = dummy_loss_from_outputs(outputs)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    return {
+        "dummy_loss": float(loss.item()),
+    }
+
+
 def main() -> int:
     args = parse_args()
     configure_default_cache_env()
@@ -171,6 +247,7 @@ def main() -> int:
         "device": str(device),
         "vision_encoder_image_mode": args.vision_encoder_image_mode,
         "pytorch_weight_path": args.pytorch_weight_path,
+        "module_step_kind": args.module_step_kind,
         "modes": list(args.modes),
         "status": "ok",
         "results": {},
@@ -194,17 +271,18 @@ def main() -> int:
 
         image_embs, image_pad_masks, image_att_masks = run_vision(model, images, img_masks)
         image_embs = [emb.detach() for emb in image_embs]
-        optimizer = build_optimizer(config, model)
         mode_order = [mode for mode in args.modes if mode != "entire"]
         if "entire" in args.modes:
             mode_order.append("entire")
 
         for mode in mode_order:
             clear_gradients(model)
+            module_optimizer = None
+            restore_states = None
             if mode == "vision":
-                run = lambda: run_vision(model, images, img_masks)
+                forward_fn = lambda: run_vision(model, images, img_masks)
             elif mode == "llm":
-                run = lambda: run_llm(
+                forward_fn = lambda: run_llm(
                     model,
                     image_embs,
                     image_pad_masks,
@@ -213,21 +291,45 @@ def main() -> int:
                     lang_masks,
                 )
             elif mode == "action":
-                run = lambda: run_action(model, state, x_t, timestep)
+                forward_fn = lambda: run_action(model, state, x_t, timestep)
             else:
-                run = lambda: run_entire(model, optimizer, observation, actions, config.optimizer.clip_gradient_norm)
+                entire_optimizer = build_optimizer(config, model)
+                run = lambda: run_entire(
+                    model,
+                    entire_optimizer,
+                    observation,
+                    actions,
+                    config.optimizer.clip_gradient_norm,
+                )
 
-            outputs, elapsed_ms, peak_memory = measure_region(device, run)
-            result = {
-                "status": "ok",
-                "elapsed_ms": elapsed_ms,
-                **peak_memory,
-            }
-            if isinstance(outputs, dict):
-                result.update(outputs)
-            payload["results"][mode] = result
-            del outputs
-            clear_gradients(model)
+            if mode != "entire":
+                if args.module_step_kind == "train_like":
+                    module_parameters = get_module_parameters(model, mode)
+                    restore_states = set_trainable_parameters(model, module_parameters)
+                    module_optimizer = build_optimizer_for_parameters(config, module_parameters)
+                    run = lambda forward_fn=forward_fn, module_optimizer=module_optimizer: run_module_train_like(
+                        forward_fn,
+                        module_optimizer,
+                    )
+                else:
+                    run = forward_fn
+
+            try:
+                outputs, elapsed_ms, peak_memory = measure_region(device, run)
+                result = {
+                    "status": "ok",
+                    "elapsed_ms": elapsed_ms,
+                    **peak_memory,
+                }
+                if isinstance(outputs, dict):
+                    result.update(outputs)
+                payload["results"][mode] = result
+                del outputs
+            finally:
+                clear_gradients(model)
+                if restore_states is not None:
+                    restore_trainable_parameters(restore_states)
+                del module_optimizer
 
     except Exception as exc:  # noqa: BLE001
         payload["status"] = "oom" if _sweep.is_cuda_oom("".join(traceback.format_exception(exc))) else "error"
