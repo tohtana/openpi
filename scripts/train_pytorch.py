@@ -66,6 +66,10 @@ PROFILE_COUNT_KEYS = (
     "vision_token_count",
     "prompt_token_count",
 )
+PROFILE_MEMORY_KEYS = (
+    "peak_allocated_mb",
+    "peak_reserved_mb",
+)
 
 
 def init_logging():
@@ -334,6 +338,12 @@ def average_numeric_metrics(infos):
     return {key: sum(info.get(key, 0.0) for info in infos) / len(infos) for key in keys}
 
 
+def max_numeric_metrics(infos, keys):
+    if not infos:
+        return {}
+    return {key: max(info.get(key, 0.0) for info in infos) for key in keys}
+
+
 def compute_batch_profile_counts(observation, *, vision_tokens_per_image):
     batch_size = observation.state.shape[0]
     active_image_count = sum(
@@ -353,7 +363,7 @@ def compute_batch_profile_counts(observation, *, vision_tokens_per_image):
     }
 
 
-def build_step_profile(data_loading_ms, device_metrics, step_total_ms, count_metrics):
+def build_step_profile(data_loading_ms, device_metrics, step_total_ms, count_metrics, peak_memory_metrics):
     profile = {key: float(device_metrics.get(key, 0.0)) for key in PROFILE_TIMING_KEYS}
     profile["data_loading_ms"] = float(data_loading_ms)
     profile["step_total_ms"] = float(step_total_ms)
@@ -374,6 +384,8 @@ def build_step_profile(data_loading_ms, device_metrics, step_total_ms, count_met
         if count_metrics["active_image_count"] > 0.0
         else 0.0
     )
+    for key in PROFILE_MEMORY_KEYS:
+        profile[key] = float(peak_memory_metrics.get(key, 0.0))
     for key in ("prefix_token_count", "vision_token_count", "prompt_token_count"):
         profile[key] = float(count_metrics[key])
     return profile
@@ -403,6 +415,58 @@ def format_profile_counts(profile):
         f"vision_token_count={profile['vision_token_count']:.1f} "
         f"prompt_token_count={profile['prompt_token_count']:.1f}]"
     )
+
+
+def format_profile_memory(profile):
+    return (
+        "profile_mem["
+        f"peak_allocated_mb={profile['peak_allocated_mb']:.1f} "
+        f"peak_reserved_mb={profile['peak_reserved_mb']:.1f}]"
+    )
+
+
+def resolve_model_config(config: _config.TrainConfig):
+    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+        return openpi.models.pi0_config.Pi0Config(
+            dtype=config.pytorch_training_precision,
+            action_dim=config.model.action_dim,
+            action_horizon=config.model.action_horizon,
+            max_token_len=config.model.max_token_len,
+            paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
+            action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
+            pi05=getattr(config.model, "pi05", False),
+            vision_encoder_image_mode=getattr(config.model, "vision_encoder_image_mode", "iterative"),
+        )
+
+    model_cfg = config.model
+    object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+    return model_cfg
+
+
+def build_pytorch_model(config: _config.TrainConfig, device: torch.device):
+    model_cfg = resolve_model_config(config)
+    logging.info("Configured vision encoder image mode: %s", model_cfg.vision_encoder_image_mode)
+    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        enable_gradient_checkpointing = True
+        model.gradient_checkpointing_enable()
+        logging.info("Enabled gradient checkpointing for memory optimization")
+    else:
+        enable_gradient_checkpointing = False
+        logging.info("Gradient checkpointing is not supported for this model")
+
+    return model, model_cfg, enable_gradient_checkpointing
+
+
+def load_pytorch_weights_if_needed(model, config: _config.TrainConfig):
+    if config.pytorch_weight_path is None:
+        return
+
+    logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+    model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+    safetensors.torch.load_model(model, model_path)
+    logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
 
 def train_loop(config: _config.TrainConfig):
@@ -489,33 +553,7 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
-        # Convert dataclass to Pi0Config if needed
-        model_cfg = openpi.models.pi0_config.Pi0Config(
-            dtype=config.pytorch_training_precision,
-            action_dim=config.model.action_dim,
-            action_horizon=config.model.action_horizon,
-            max_token_len=config.model.max_token_len,
-            paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
-            action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
-            pi05=getattr(config.model, "pi05", False),
-            vision_encoder_image_mode=getattr(config.model, "vision_encoder_image_mode", "iterative"),
-        )
-    else:
-        model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
-        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
-
-    logging.info("Configured vision encoder image mode: %s", model_cfg.vision_encoder_image_mode)
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
-
-    if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
-        model.gradient_checkpointing_enable()
-        logging.info("Enabled gradient checkpointing for memory optimization")
-    else:
-        enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
+    model, model_cfg, enable_gradient_checkpointing = build_pytorch_model(config, device)
 
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():
@@ -543,14 +581,10 @@ def train_loop(config: _config.TrainConfig):
     vision_tokens_per_image = model_to_profile.paligemma_with_expert.paligemma.config.text_config.num_image_tokens
 
     # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+    load_pytorch_weights_if_needed(
+        model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model,
+        config,
+    )
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -639,6 +673,9 @@ def train_loop(config: _config.TrainConfig):
         )
 
         device_profiler = _profiling.DeviceSectionProfiler(device) if profile_step else None
+        peak_memory_tracker = _profiling.PeakMemoryTracker(device) if profile_step else None
+        if peak_memory_tracker is not None:
+            peak_memory_tracker.reset()
         transfer_context = device_profiler.record("host_to_device_ms") if device_profiler is not None else nullcontext()
 
         # The unified data loader returns (observation, actions) tuple
@@ -693,11 +730,13 @@ def train_loop(config: _config.TrainConfig):
         profile_metrics = None
         if device_profiler is not None:
             device_metrics = device_profiler.finalize()
+            peak_memory_metrics = peak_memory_tracker.snapshot() if peak_memory_tracker is not None else {}
             profile_metrics = build_step_profile(
                 data_loading_ms=data_loading_ms,
                 device_metrics=device_metrics,
                 step_total_ms=(time.perf_counter() - step_started_at) * 1000.0,
                 count_metrics=count_metrics,
+                peak_memory_metrics=peak_memory_metrics,
             )
 
         # Collect stats
@@ -731,7 +770,11 @@ def train_loop(config: _config.TrainConfig):
             )
             if profile_infos:
                 avg_profile = average_numeric_metrics(profile_infos)
-                log_line = f"{log_line} {format_profile_metrics(avg_profile)} {format_profile_counts(avg_profile)}"
+                peak_profile = max_numeric_metrics(profile_infos, PROFILE_MEMORY_KEYS)
+                log_line = (
+                    f"{log_line} {format_profile_metrics(avg_profile)}"
+                    f" {format_profile_counts(avg_profile)} {format_profile_memory(peak_profile)}"
+                )
             logging.info(log_line)
 
             # Log to wandb
@@ -746,9 +789,13 @@ def train_loop(config: _config.TrainConfig):
                     log_payload["grad_norm"] = avg_grad_norm
                 if profile_infos:
                     avg_profile = average_numeric_metrics(profile_infos)
+                    peak_profile = max_numeric_metrics(profile_infos, PROFILE_MEMORY_KEYS)
                     for key in PROFILE_TIMING_KEYS + PROFILE_COUNT_KEYS:
                         if key in avg_profile:
                             log_payload[key] = avg_profile[key]
+                    for key in PROFILE_MEMORY_KEYS:
+                        if key in peak_profile:
+                            log_payload[key] = peak_profile[key]
                 wandb.log(log_payload, step=global_step)
 
             start_time = time.time()

@@ -8,6 +8,9 @@ import time
 import torch
 
 
+_BYTES_PER_MEBIBYTE = float(1024**2)
+
+
 class WallClockTimer:
     """Accumulates wall-clock timing for host-side sections."""
 
@@ -125,3 +128,28 @@ class DeviceSectionProfiler:
             raise ValueError("Timing allocation must sum to a positive value.")
 
         return {name: float(value) / total for name, value in allocation.items()}
+
+
+class PeakMemoryTracker:
+    """Tracks peak CUDA memory and no-ops on CPU."""
+
+    def __init__(self, device: torch.device) -> None:
+        self._device = device
+        self._enabled = device.type == "cuda" and torch.cuda.is_available()
+
+    def reset(self) -> None:
+        if self._enabled:
+            torch.cuda.reset_peak_memory_stats(self._device)
+
+    def snapshot(self) -> dict[str, float]:
+        if not self._enabled:
+            return {
+                "peak_allocated_mb": 0.0,
+                "peak_reserved_mb": 0.0,
+            }
+
+        torch.cuda.synchronize(self._device)
+        return {
+            "peak_allocated_mb": torch.cuda.max_memory_allocated(self._device) / _BYTES_PER_MEBIBYTE,
+            "peak_reserved_mb": torch.cuda.max_memory_reserved(self._device) / _BYTES_PER_MEBIBYTE,
+        }

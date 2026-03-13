@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from contextlib import nullcontext
 
 import torch
@@ -111,7 +112,8 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        if os.environ.get("OPENPI_DISABLE_SAMPLE_ACTIONS_COMPILE") != "1":
+            self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -329,11 +331,35 @@ class PI0Pytorch(nn.Module):
                 images, img_masks, profiler=profiler
             )
 
-        embs.extend(image_embs)
-        pad_masks.extend(image_pad_masks)
-        att_masks.extend(image_att_masks)
+        return self.embed_prefix_from_image_embeddings(
+            image_embs,
+            image_pad_masks,
+            image_att_masks,
+            lang_tokens,
+            lang_masks,
+            profiler=profiler,
+        )
 
-        # Process language tokens
+    def embed_prefix_from_image_embeddings(
+        self,
+        image_embs,
+        image_pad_masks,
+        image_att_masks,
+        lang_tokens,
+        lang_masks,
+        *,
+        profiler=None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assemble the full prefix sequence from precomputed image embeddings and prompt tokens."""
+        def record_section(name: str):
+            if profiler is None:
+                return nullcontext()
+            return profiler.record(name)
+
+        embs = list(image_embs)
+        pad_masks = list(image_pad_masks)
+        att_masks = list(image_att_masks)
+
         def lang_embed_func(lang_tokens):
             lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
             lang_emb_dim = lang_emb.shape[-1]
@@ -345,7 +371,6 @@ class PI0Pytorch(nn.Module):
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
 
-        # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
@@ -353,7 +378,6 @@ class PI0Pytorch(nn.Module):
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
-        # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
@@ -447,6 +471,75 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    def forward_transformer(
+        self,
+        *,
+        prefix_embs: torch.Tensor | None = None,
+        prefix_pad_masks: torch.Tensor | None = None,
+        prefix_att_masks: torch.Tensor | None = None,
+        suffix_embs: torch.Tensor | None = None,
+        suffix_pad_masks: torch.Tensor | None = None,
+        suffix_att_masks: torch.Tensor | None = None,
+        adarms_cond: torch.Tensor | None = None,
+        profiler=None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Run the shared transformer path used by training for prefix-only, suffix-only, or mixed inputs."""
+        if prefix_embs is None and suffix_embs is None:
+            raise ValueError("at least one transformer input is required")
+
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            if prefix_embs is not None:
+                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            if suffix_embs is not None:
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = []
+        att_masks = []
+        if prefix_embs is not None:
+            pad_masks.append(prefix_pad_masks)
+            att_masks.append(prefix_att_masks)
+        if suffix_embs is not None:
+            pad_masks.append(suffix_pad_masks)
+            att_masks.append(suffix_att_masks)
+
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.cat(att_masks, dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        if prefix_embs is not None and suffix_embs is not None:
+            def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+                return self.paligemma_with_expert.forward_shared_attention(
+                    attention_mask=att_2d_masks_4d,
+                    position_ids=position_ids,
+                    inputs_embeds=[prefix_embs, suffix_embs],
+                    adarms_cond=[None, adarms_cond],
+                    profiler=profiler,
+                )
+
+            outputs = self._apply_checkpoint(
+                forward_func,
+                prefix_embs,
+                suffix_embs,
+                att_2d_masks_4d,
+                position_ids,
+                adarms_cond,
+            )
+            return outputs[0], outputs[1]
+
+        outputs = self.paligemma_with_expert.forward_shared_attention(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            adarms_cond=[None, adarms_cond],
+            profiler=profiler,
+        )
+        return outputs[0], outputs[1]
+
     def forward(self, observation, actions, noise=None, time=None, profiler=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         def record_section(name: str):
@@ -473,37 +566,15 @@ class PI0Pytorch(nn.Module):
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
             state, x_t, time, profiler=profiler
         )
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        # Prepare attention masks
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
-
-        # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-                profiler=profiler,
-            )
-            return suffix_out
-
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        _, suffix_out = self.forward_transformer(
+            prefix_embs=prefix_embs,
+            prefix_pad_masks=prefix_pad_masks,
+            prefix_att_masks=prefix_att_masks,
+            suffix_embs=suffix_embs,
+            suffix_pad_masks=suffix_pad_masks,
+            suffix_att_masks=suffix_att_masks,
+            adarms_cond=adarms_cond,
+            profiler=profiler,
         )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
