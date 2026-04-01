@@ -169,7 +169,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 for branch_idx, (_, _, bucket_name) in enumerate(branch_specs)
             }
             scaling = branch_specs[0][1].layers[layer_idx].self_attn.scaling
-            with record_section(allocation=attention_allocation):
+            with record_section("shared_attention_ms", allocation=attention_allocation):
                 att_output, _ = modeling_gemma.eager_attention_forward(
                     branch_specs[0][1].layers[layer_idx].self_attn,
                     query_states,

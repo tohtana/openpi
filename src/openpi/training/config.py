@@ -529,6 +529,14 @@ class TrainConfig:
     enable_profiling: bool = False
     # Number of initial steps to skip before collecting profiling metrics.
     profiling_warmup_steps: int = 1
+    # If true, emit a PyTorch profiler timeline with kernel traces.
+    enable_torch_profiler: bool = False
+    # Number of initial steps to skip before collecting a PyTorch profiler trace.
+    torch_profiler_warmup_steps: int = 50
+    # Number of steps to record after the warmup window finishes.
+    torch_profiler_active_steps: int = 3
+    # Optional output directory for TensorBoard-compatible torch profiler traces.
+    torch_profiler_trace_dir: str | None = None
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -552,6 +560,13 @@ class TrainConfig:
         return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
 
     @property
+    def resolved_torch_profiler_trace_dir(self) -> pathlib.Path:
+        """Get the output directory for torch profiler traces."""
+        if self.torch_profiler_trace_dir:
+            return pathlib.Path(self.torch_profiler_trace_dir).resolve()
+        return (self.checkpoint_dir / "torch_profiler").resolve()
+
+    @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
         """Get the filter for the trainable parameters."""
         return nnx.All(nnx.Param, nnx.Not(self.freeze_filter))
@@ -561,6 +576,19 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
         if self.profiling_warmup_steps < 0:
             raise ValueError("profiling_warmup_steps must be non-negative.")
+        if self.torch_profiler_warmup_steps < 0:
+            raise ValueError("torch_profiler_warmup_steps must be non-negative.")
+        if self.torch_profiler_active_steps < 1:
+            raise ValueError("torch_profiler_active_steps must be at least 1.")
+        if (
+            self.enable_torch_profiler
+            and self.num_train_steps < self.torch_profiler_warmup_steps + self.torch_profiler_active_steps
+        ):
+            raise ValueError(
+                "num_train_steps must be at least "
+                f"{self.torch_profiler_warmup_steps + self.torch_profiler_active_steps} "
+                "when enable_torch_profiler is set."
+            )
 
 
 # Use `get_config` if you need to get a config by name in your code.

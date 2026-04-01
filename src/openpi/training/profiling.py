@@ -1,14 +1,117 @@
 from __future__ import annotations
 
+import dataclasses
 from collections import defaultdict
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+import pathlib
 import time
 
 import torch
 
 
 _BYTES_PER_MEBIBYTE = float(1024**2)
+
+
+@dataclasses.dataclass(frozen=True)
+class TorchProfilerSchedule:
+    wait_steps: int
+    warmup_steps: int
+    active_steps: int
+    repeat: int = 1
+
+    def build(self):
+        return torch.profiler.schedule(
+            wait=self.wait_steps,
+            warmup=self.warmup_steps,
+            active=self.active_steps,
+            repeat=self.repeat,
+        )
+
+
+def resolve_torch_profiler_schedule(*, warmup_steps: int, active_steps: int) -> TorchProfilerSchedule:
+    profiler_warmup_steps = 1 if warmup_steps > 0 else 0
+    wait_steps = max(0, warmup_steps - profiler_warmup_steps)
+    return TorchProfilerSchedule(
+        wait_steps=wait_steps,
+        warmup_steps=profiler_warmup_steps,
+        active_steps=active_steps,
+    )
+
+
+@contextmanager
+def record_torch_profile_section(name: str | None, *, enabled: bool) -> Iterator[None]:
+    if not enabled or name is None:
+        yield
+        return
+
+    with torch.profiler.record_function(name):
+        yield
+
+
+class TorchProfilerSession:
+    """Owns the lifecycle of an optional torch.profiler session."""
+
+    def __init__(
+        self,
+        profiler: torch.profiler.profile | None,
+        *,
+        schedule: TorchProfilerSchedule | None = None,
+        trace_dir: pathlib.Path | None = None,
+        worker_name: str | None = None,
+    ) -> None:
+        self._profiler = profiler
+        self.schedule = schedule
+        self.trace_dir = trace_dir
+        self.worker_name = worker_name
+
+    @property
+    def enabled(self) -> bool:
+        return self._profiler is not None
+
+    def step(self) -> None:
+        if self._profiler is not None:
+            self._profiler.step()
+
+    def close(self) -> None:
+        if self._profiler is not None:
+            self._profiler.stop()
+            self._profiler = None
+
+
+def create_torch_profiler_session(
+    *,
+    enabled: bool,
+    device: torch.device,
+    warmup_steps: int,
+    active_steps: int,
+    trace_dir: pathlib.Path,
+    worker_name: str,
+) -> TorchProfilerSession:
+    if not enabled:
+        return TorchProfilerSession(None)
+
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    schedule = resolve_torch_profiler_schedule(warmup_steps=warmup_steps, active_steps=active_steps)
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if device.type == "cuda" and torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    profiler = torch.profiler.profile(
+        activities=activities,
+        schedule=schedule.build(),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(str(trace_dir), worker_name=worker_name),
+        profile_memory=False,
+        record_shapes=False,
+        with_stack=False,
+    )
+    profiler.start()
+    return TorchProfilerSession(
+        profiler,
+        schedule=schedule,
+        trace_dir=trace_dir,
+        worker_name=worker_name,
+    )
 
 
 class WallClockTimer:
@@ -37,9 +140,17 @@ class WallClockTimer:
 class DeviceSectionProfiler:
     """Collects device timings with CUDA events and falls back to wall-clock on CPU."""
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        enable_timings: bool = True,
+        enable_trace: bool = False,
+    ) -> None:
         self._device = device
-        self._use_cuda_events = device.type == "cuda" and torch.cuda.is_available()
+        self._enable_timings = enable_timings
+        self._enable_trace = enable_trace
+        self._use_cuda_events = enable_timings and device.type == "cuda" and torch.cuda.is_available()
         self._recording_suspended = False
         self._totals_ms: dict[str, float] = defaultdict(float)
         self._cuda_events: list[
@@ -69,23 +180,32 @@ class DeviceSectionProfiler:
         if name is None and normalized_allocation is None:
             raise ValueError("Either name or allocation must be provided for a timed section.")
 
+        trace_context = record_torch_profile_section(name, enabled=self._enable_trace)
+
+        if not self._enable_timings:
+            with trace_context:
+                yield
+            return
+
         if self._use_cuda_events:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
+            with trace_context:
+                start_event.record()
+                try:
+                    yield
+                finally:
+                    end_event.record()
+                    self._cuda_events.append((name, start_event, end_event, normalized_allocation))
+            return
+
+        with trace_context:
+            start = time.perf_counter()
             try:
                 yield
             finally:
-                end_event.record()
-                self._cuda_events.append((name, start_event, end_event, normalized_allocation))
-            return
-
-        start = time.perf_counter()
-        try:
-            yield
-        finally:
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            self._record_elapsed(name, elapsed_ms, normalized_allocation)
+                elapsed_ms = (time.perf_counter() - start) * 1000.0
+                self._record_elapsed(name, elapsed_ms, normalized_allocation)
 
     def add_ms(self, name: str, value_ms: float) -> None:
         self._totals_ms[name] += value_ms

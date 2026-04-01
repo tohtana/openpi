@@ -621,6 +621,15 @@ def train_loop(config: _config.TrainConfig):
     start_time = time.time()
     infos = []  # Collect stats over log interval
     profile_infos = []
+    torch_profiler_worker_name = f"rank{dist.get_rank()}" if dist.is_initialized() else "rank0"
+    torch_profiler = _profiling.create_torch_profiler_session(
+        enabled=config.enable_torch_profiler,
+        device=device,
+        warmup_steps=config.torch_profiler_warmup_steps,
+        active_steps=config.torch_profiler_active_steps,
+        trace_dir=config.resolved_torch_profiler_trace_dir,
+        worker_name=torch_profiler_worker_name,
+    )
     if is_main:
         logging.info(
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
@@ -641,6 +650,20 @@ def train_loop(config: _config.TrainConfig):
             logging.info(
                 f"Step profiling enabled; metrics will be collected from step {config.profiling_warmup_steps} onward with synchronous timing."
             )
+        if torch_profiler.enabled:
+            assert torch_profiler.schedule is not None
+            assert torch_profiler.trace_dir is not None
+            logging.info(
+                "PyTorch profiler enabled; traces will be written to %s with wait=%d warmup=%d active=%d "
+                "(user warmup=%d, active=%d, worker=%s).",
+                torch_profiler.trace_dir,
+                torch_profiler.schedule.wait_steps,
+                torch_profiler.schedule.warmup_steps,
+                torch_profiler.schedule.active_steps,
+                config.torch_profiler_warmup_steps,
+                config.torch_profiler_active_steps,
+                torch_profiler_worker_name,
+            )
 
     # Training loop - iterate until we reach num_train_steps
     pbar = (
@@ -650,178 +673,195 @@ def train_loop(config: _config.TrainConfig):
     )
     loader_iter = iter(loader)
 
-    while global_step < config.num_train_steps:
-        # Set epoch for distributed training
-        if use_ddp and hasattr(loader, "set_epoch"):
-            loader.set_epoch(global_step // len(loader))
+    try:
+        while global_step < config.num_train_steps:
+            # Set epoch for distributed training
+            if use_ddp and hasattr(loader, "set_epoch"):
+                loader.set_epoch(global_step // len(loader))
 
-        profile_step = config.enable_profiling and global_step >= config.profiling_warmup_steps
-        step_started_at = time.perf_counter()
+            profile_step = config.enable_profiling and global_step >= config.profiling_warmup_steps
+            trace_enabled = torch_profiler.enabled
+            step_started_at = time.perf_counter()
+            data_loading_ms = 0.0
+            profile_metrics = None
 
-        if profile_step:
-            data_loading_started_at = time.perf_counter()
-        try:
-            observation, actions = next(loader_iter)
-        except StopIteration:
-            loader_iter = iter(loader)
-            observation, actions = next(loader_iter)
-        data_loading_ms = (time.perf_counter() - data_loading_started_at) * 1000.0 if profile_step else 0.0
-        count_metrics = (
-            compute_batch_profile_counts(observation, vision_tokens_per_image=vision_tokens_per_image)
-            if profile_step
-            else None
-        )
-
-        device_profiler = _profiling.DeviceSectionProfiler(device) if profile_step else None
-        peak_memory_tracker = _profiling.PeakMemoryTracker(device) if profile_step else None
-        if peak_memory_tracker is not None:
-            peak_memory_tracker.reset()
-        transfer_context = device_profiler.record("host_to_device_ms") if device_profiler is not None else nullcontext()
-
-        # The unified data loader returns (observation, actions) tuple
-        with transfer_context:
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
-
-        # Update LR
-        for pg in optim.param_groups:
-            pg["lr"] = lr_schedule(global_step)
-
-        # Forward pass
-        losses = model(observation, actions, profiler=device_profiler)
-        if device_profiler is not None:
-            device_profiler.suspend()
-        # Ensure losses is a tensor and handle different return types
-        if isinstance(losses, list | tuple):
-            losses = torch.stack(losses)
-        elif not isinstance(losses, torch.Tensor):
-            losses = torch.tensor(losses, device=device, dtype=torch.float32)
-
-        loss = losses.mean()
-
-        # Backward pass
-        backward_context = (
-            device_profiler.record("backward_ms", force=True) if device_profiler is not None else nullcontext()
-        )
-        with backward_context:
-            loss.backward()
-
-        # Log memory usage after backward pass
-        if global_step < 5 and is_main and torch.cuda.is_available():
-            log_memory_usage(device, global_step, "after_backward")
-
-        optimizer_context = (
-            device_profiler.record("optimizer_ms", force=True) if device_profiler is not None else nullcontext()
-        )
-        with optimizer_context:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
-
-            # Optimizer step
-            optim.step()
-            optim.zero_grad(set_to_none=True)
-
-            # Clear gradients more aggressively
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
-
-        profile_metrics = None
-        if device_profiler is not None:
-            device_metrics = device_profiler.finalize()
-            peak_memory_metrics = peak_memory_tracker.snapshot() if peak_memory_tracker is not None else {}
-            profile_metrics = build_step_profile(
-                data_loading_ms=data_loading_ms,
-                device_metrics=device_metrics,
-                step_total_ms=(time.perf_counter() - step_started_at) * 1000.0,
-                count_metrics=count_metrics,
-                peak_memory_metrics=peak_memory_metrics,
-            )
-
-        # Collect stats
-        if is_main:
-            infos.append(
-                {
-                    "loss": loss.item(),
-                    "learning_rate": optim.param_groups[0]["lr"],
-                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                }
-            )
-            if profile_metrics is not None:
-                profile_infos.append(profile_metrics)
-
-        if is_main and (global_step % config.log_interval == 0):
-            elapsed = time.time() - start_time
-
-            # Average stats over log interval
-            avg_loss = sum(info["loss"] for info in infos) / len(infos)
-            avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
-
-            avg_grad_norm = None
-            if any("grad_norm" in info for info in infos):
-                vals = [info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None]
-                if len(vals) > 0:
-                    avg_grad_norm = sum(vals) / len(vals)
-            log_line = (
-                f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                if avg_grad_norm is not None
-                else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-            )
-            if profile_infos:
-                avg_profile = average_numeric_metrics(profile_infos)
-                peak_profile = max_numeric_metrics(profile_infos, PROFILE_MEMORY_KEYS)
-                log_line = (
-                    f"{log_line} {format_profile_metrics(avg_profile)}"
-                    f" {format_profile_counts(avg_profile)} {format_profile_memory(peak_profile)}"
+            step_profiler = None
+            if profile_step or trace_enabled:
+                step_profiler = _profiling.DeviceSectionProfiler(
+                    device,
+                    enable_timings=profile_step,
+                    enable_trace=trace_enabled,
                 )
-            logging.info(log_line)
 
-            # Log to wandb
-            if config.wandb_enabled and len(infos) > 0:
-                log_payload = {
-                    "loss": avg_loss,
-                    "learning_rate": avg_lr,
-                    "step": global_step,
-                    "time_per_step": elapsed / config.log_interval,
-                }
-                if avg_grad_norm is not None:
-                    log_payload["grad_norm"] = avg_grad_norm
+            peak_memory_tracker = _profiling.PeakMemoryTracker(device) if profile_step else None
+            if peak_memory_tracker is not None:
+                peak_memory_tracker.reset()
+
+            with _profiling.record_torch_profile_section("train_step", enabled=trace_enabled):
+                data_loading_started_at = time.perf_counter() if profile_step else None
+                with _profiling.record_torch_profile_section("data_loading", enabled=trace_enabled):
+                    try:
+                        observation, actions = next(loader_iter)
+                    except StopIteration:
+                        loader_iter = iter(loader)
+                        observation, actions = next(loader_iter)
+                if data_loading_started_at is not None:
+                    data_loading_ms = (time.perf_counter() - data_loading_started_at) * 1000.0
+
+                count_metrics = (
+                    compute_batch_profile_counts(observation, vision_tokens_per_image=vision_tokens_per_image)
+                    if profile_step
+                    else None
+                )
+
+                transfer_context = (
+                    step_profiler.record("host_to_device_ms") if step_profiler is not None else nullcontext()
+                )
+
+                # The unified data loader returns (observation, actions) tuple
+                with transfer_context:
+                    observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+                    actions = actions.to(torch.float32)  # noqa: PLW2901
+                    actions = actions.to(device)  # noqa: PLW2901
+
+                # Update LR
+                for pg in optim.param_groups:
+                    pg["lr"] = lr_schedule(global_step)
+
+                # Forward pass
+                losses = model(observation, actions, profiler=step_profiler)
+                if step_profiler is not None:
+                    step_profiler.suspend()
+                # Ensure losses is a tensor and handle different return types
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+
+                loss = losses.mean()
+
+                # Backward pass
+                backward_context = (
+                    step_profiler.record("backward_ms", force=True) if step_profiler is not None else nullcontext()
+                )
+                with backward_context:
+                    loss.backward()
+
+                # Log memory usage after backward pass
+                if global_step < 5 and is_main and torch.cuda.is_available():
+                    log_memory_usage(device, global_step, "after_backward")
+
+                optimizer_context = (
+                    step_profiler.record("optimizer_ms", force=True) if step_profiler is not None else nullcontext()
+                )
+                with optimizer_context:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), max_norm=config.optimizer.clip_gradient_norm
+                    )
+
+                    # Optimizer step
+                    optim.step()
+                    optim.zero_grad(set_to_none=True)
+
+                    # Clear gradients more aggressively
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            param.grad.detach_()
+                            param.grad = None
+
+            if profile_step:
+                assert step_profiler is not None
+                device_metrics = step_profiler.finalize()
+                peak_memory_metrics = peak_memory_tracker.snapshot() if peak_memory_tracker is not None else {}
+                profile_metrics = build_step_profile(
+                    data_loading_ms=data_loading_ms,
+                    device_metrics=device_metrics,
+                    step_total_ms=(time.perf_counter() - step_started_at) * 1000.0,
+                    count_metrics=count_metrics,
+                    peak_memory_metrics=peak_memory_metrics,
+                )
+
+            # Collect stats
+            if is_main:
+                infos.append(
+                    {
+                        "loss": loss.item(),
+                        "learning_rate": optim.param_groups[0]["lr"],
+                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                    }
+                )
+                if profile_metrics is not None:
+                    profile_infos.append(profile_metrics)
+
+            if is_main and (global_step % config.log_interval == 0):
+                elapsed = time.time() - start_time
+
+                # Average stats over log interval
+                avg_loss = sum(info["loss"] for info in infos) / len(infos)
+                avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+
+                avg_grad_norm = None
+                if any("grad_norm" in info for info in infos):
+                    vals = [info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None]
+                    if len(vals) > 0:
+                        avg_grad_norm = sum(vals) / len(vals)
+                log_line = (
+                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                    if avg_grad_norm is not None
+                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                )
                 if profile_infos:
                     avg_profile = average_numeric_metrics(profile_infos)
                     peak_profile = max_numeric_metrics(profile_infos, PROFILE_MEMORY_KEYS)
-                    for key in PROFILE_TIMING_KEYS + PROFILE_COUNT_KEYS:
-                        if key in avg_profile:
-                            log_payload[key] = avg_profile[key]
-                    for key in PROFILE_MEMORY_KEYS:
-                        if key in peak_profile:
-                            log_payload[key] = peak_profile[key]
-                wandb.log(log_payload, step=global_step)
+                    log_line = (
+                        f"{log_line} {format_profile_metrics(avg_profile)}"
+                        f" {format_profile_counts(avg_profile)} {format_profile_memory(peak_profile)}"
+                    )
+                logging.info(log_line)
 
-            start_time = time.time()
-            infos = []  # Reset stats collection
-            profile_infos = []
+                # Log to wandb
+                if config.wandb_enabled and len(infos) > 0:
+                    log_payload = {
+                        "loss": avg_loss,
+                        "learning_rate": avg_lr,
+                        "step": global_step,
+                        "time_per_step": elapsed / config.log_interval,
+                    }
+                    if avg_grad_norm is not None:
+                        log_payload["grad_norm"] = avg_grad_norm
+                    if profile_infos:
+                        avg_profile = average_numeric_metrics(profile_infos)
+                        peak_profile = max_numeric_metrics(profile_infos, PROFILE_MEMORY_KEYS)
+                        for key in PROFILE_TIMING_KEYS + PROFILE_COUNT_KEYS:
+                            if key in avg_profile:
+                                log_payload[key] = avg_profile[key]
+                        for key in PROFILE_MEMORY_KEYS:
+                            if key in peak_profile:
+                                log_payload[key] = peak_profile[key]
+                    wandb.log(log_payload, step=global_step)
 
-        global_step += 1
-        # Save checkpoint using the new mechanism
-        save_checkpoint(model, optim, global_step, config, is_main, data_config)
+                start_time = time.time()
+                infos = []  # Reset stats collection
+                profile_infos = []
 
-        # Update progress bar
+            torch_profiler.step()
+            global_step += 1
+            # Save checkpoint using the new mechanism
+            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+
+            # Update progress bar
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix(
+                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                )
+    finally:
+        torch_profiler.close()
         if pbar is not None:
-            pbar.update(1)
-            pbar.set_postfix(
-                {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
-            )
-
-    # Close progress bar
-    if pbar is not None:
-        pbar.close()
-
-    # Finish wandb run
-    if is_main and config.wandb_enabled:
-        wandb.finish()
-
-    cleanup_ddp()
+            pbar.close()
+        if is_main and config.wandb_enabled:
+            wandb.finish()
+        cleanup_ddp()
 
 
 def main():
